@@ -351,6 +351,7 @@ function ClusterCard({ cluster, onRefresh, toast }) {
       await fetchPools()
     } catch (e) {
       toast.show(e.message, 'error')
+      await fetchPools()
     } finally {
       setScaling(null)
     }
@@ -361,11 +362,17 @@ function ClusterCard({ cluster, onRefresh, toast }) {
     setScaling('up')
     try {
       const result = await api.scaleUp(cluster.id)
-      const restored = result.operations?.map(o => `${o.pool}→${o.target_count}`).join(', ')
-      toast.show(`Restoring: ${restored}`, 'success')
+      if (result.status === 'partial_failure') {
+        const failed = result.errors?.map(e => e.pool).join(', ')
+        toast.show(`Scale-up failed for: ${failed}. Snapshot preserved — retry when capacity is available.`, 'error')
+      } else {
+        const restored = result.operations?.map(o => `${o.pool}→${o.target_count}`).join(', ')
+        toast.show(`Restoring: ${restored}`, 'success')
+      }
       await fetchPools()
     } catch (e) {
       toast.show(e.message, 'error')
+      await fetchPools()
     } finally {
       setScaling(null)
     }

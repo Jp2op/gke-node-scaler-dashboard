@@ -1,7 +1,7 @@
 """
 GKE Node Scaler - Cloud Run Backend
-Manages node pool scaling across multiple GKE clusters and GCP projects.
-All state persisted in Firestore. Stateless Cloud Run compatible.
+Uses Firestore MongoDB-compatible mode via pymongo.
+All state persisted in MongoDB. Stateless Cloud Run compatible.
 """
 
 import os
@@ -14,9 +14,8 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from google.cloud import container_v1
-from google.cloud import firestore
 from google.api_core import exceptions as gcp_exceptions
-from google.protobuf import field_mask_pb2
+from pymongo import MongoClient
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -32,21 +31,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-FIRESTORE_COLLECTION_CLUSTERS = "gke_scaler_clusters"
-FIRESTORE_COLLECTION_SNAPSHOTS = "gke_scaler_snapshots"
-FIRESTORE_COLLECTION_SCHEDULES = "gke_scaler_schedules"
-FIRESTORE_COLLECTION_AUDIT = "gke_scaler_audit"
+MONGO_URI = os.environ.get("MONGO_URI", "")
+MONGO_DB = os.environ.get("MONGO_DB", "gke_scaler")
+
+_mongo_client = None
 
 
-FIRESTORE_PROJECT = os.environ.get("FIRESTORE_PROJECT")  # None = same as Cloud Run project
-FIRESTORE_DATABASE = os.environ.get("FIRESTORE_DATABASE", "(default)")
-
-
-def get_db() -> firestore.Client:
-    kwargs = {"database": FIRESTORE_DATABASE}
-    if FIRESTORE_PROJECT:
-        kwargs["project"] = FIRESTORE_PROJECT
-    return firestore.Client(**kwargs)
+def get_db():
+    global _mongo_client
+    if _mongo_client is None:
+        if not MONGO_URI:
+            raise HTTPException(500, "MONGO_URI environment variable not set")
+        _mongo_client = MongoClient(MONGO_URI)
+    return _mongo_client[MONGO_DB]
 
 
 def get_gke_client() -> container_v1.ClusterManagerClient:
@@ -58,10 +55,10 @@ def get_gke_client() -> container_v1.ClusterManagerClient:
 
 class ClusterRegister(BaseModel):
     project_id: str
-    location: str  # zone or region
+    location: str
     cluster_name: str
     display_name: str = ""
-    environment: str = "dev"  # dev, qa, prod, staging, etc.
+    environment: str = "dev"
 
 
 class ClusterUpdate(BaseModel):
@@ -72,7 +69,7 @@ class ClusterUpdate(BaseModel):
 class ScheduleCreate(BaseModel):
     cluster_id: str
     action: str = Field(..., pattern="^(scale_down|scale_up)$")
-    cron: str  # cron expression
+    cron: str
     timezone: str = "Asia/Kolkata"
     enabled: bool = True
     description: str = ""
@@ -86,9 +83,15 @@ class ScheduleUpdate(BaseModel):
 
 
 class ScaleRequest(BaseModel):
-    """Optional: scale specific pools only."""
-    node_pools: Optional[list[str]] = None  # None = all pools
+    node_pools: Optional[list[str]] = None
     triggered_by: str = "manual"
+
+
+class ManualScaleRequest(BaseModel):
+    node_count: int = Field(..., ge=0)
+    update_autoscaling: bool = False
+    min_node_count: Optional[int] = None
+    max_node_count: Optional[int] = None
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -98,10 +101,20 @@ def _cluster_parent(project_id: str, location: str, cluster_name: str) -> str:
     return f"projects/{project_id}/locations/{location}/clusters/{cluster_name}"
 
 
-def _write_audit(db: firestore.Client, entry: dict):
+def _write_audit(db, entry: dict):
     entry["timestamp"] = datetime.now(timezone.utc).isoformat()
-    entry["id"] = str(uuid.uuid4())
-    db.collection(FIRESTORE_COLLECTION_AUDIT).document(entry["id"]).set(entry)
+    entry["_id"] = str(uuid.uuid4())
+    db.audit.insert_one(entry)
+
+
+def _serialize(doc):
+    """Convert MongoDB doc to JSON-safe dict."""
+    if doc is None:
+        return None
+    doc = dict(doc)
+    if "_id" in doc:
+        doc["id"] = str(doc.pop("_id"))
+    return doc
 
 
 def _fetch_node_pools(
@@ -110,7 +123,6 @@ def _fetch_node_pools(
     location: str,
     cluster_name: str,
 ) -> list[dict]:
-    """Fetch live node pool info from GKE API."""
     parent = _cluster_parent(project_id, location, cluster_name)
     try:
         cluster = gke.get_cluster(name=parent)
@@ -125,6 +137,27 @@ def _fetch_node_pools(
 
     pools = []
     for np in cluster.node_pools:
+        # instance_group_urls tells us real node count:
+        # each URL is one zone's instance group, and for a resized pool
+        # the count of managed instances = total nodes.
+        # When pool is scaled to 0, instance_group_urls is empty.
+        ig_count = len(np.instance_group_urls) if np.instance_group_urls else 0
+
+        # Best-effort live node count:
+        # - If status is RUNNING and no instance groups → 0 nodes
+        # - If status is RECONCILING → scaling in progress
+        # - initial_node_count is stale (creation-time value), don't trust it
+        # Use the node pool's status_message and instance groups to infer
+        if np.status and np.status.name in ("STOPPING", "ERROR"):
+            current_count = 0
+        elif ig_count == 0:
+            current_count = 0
+        else:
+            # For regional clusters: nodes = initial_node_count * num_zones
+            # For zonal clusters: nodes = initial_node_count
+            # But after resize, initial_node_count reflects the resize target
+            current_count = np.initial_node_count * max(ig_count, 1)
+
         pool_info = {
             "name": np.name,
             "status": np.status.name if np.status else "UNKNOWN",
@@ -138,15 +171,13 @@ def _fetch_node_pools(
             "max_node_count": (
                 np.autoscaling.max_node_count if np.autoscaling else 0
             ),
-            "current_node_count": np.initial_node_count,  # best effort
+            "current_node_count": current_count,
             "machine_type": (
                 np.config.machine_type if np.config else "unknown"
             ),
             "locations": list(np.locations) if np.locations else [],
+            "instance_groups": ig_count,
         }
-        # For regional clusters, node count is per-zone
-        if np.instance_group_urls:
-            pool_info["instance_groups"] = len(np.instance_group_urls)
         pools.append(pool_info)
 
     return pools
@@ -158,12 +189,8 @@ def _fetch_node_pools(
 @app.get("/api/clusters")
 def list_clusters():
     db = get_db()
-    docs = db.collection(FIRESTORE_COLLECTION_CLUSTERS).stream()
-    clusters = []
-    for doc in docs:
-        data = doc.to_dict()
-        data["id"] = doc.id
-        clusters.append(data)
+    docs = db.clusters.find()
+    clusters = [_serialize(doc) for doc in docs]
     return {"clusters": clusters}
 
 
@@ -171,19 +198,14 @@ def list_clusters():
 def register_cluster(req: ClusterRegister):
     db = get_db()
 
-    # Check for duplicates
-    existing = (
-        db.collection(FIRESTORE_COLLECTION_CLUSTERS)
-        .where("project_id", "==", req.project_id)
-        .where("cluster_name", "==", req.cluster_name)
-        .where("location", "==", req.location)
-        .limit(1)
-        .get()
-    )
-    if list(existing):
+    existing = db.clusters.find_one({
+        "project_id": req.project_id,
+        "cluster_name": req.cluster_name,
+        "location": req.location,
+    })
+    if existing:
         raise HTTPException(409, "Cluster already registered")
 
-    # Verify connectivity
     gke = get_gke_client()
     try:
         parent = _cluster_parent(req.project_id, req.location, req.cluster_name)
@@ -199,6 +221,7 @@ def register_cluster(req: ClusterRegister):
 
     cluster_id = str(uuid.uuid4())[:8]
     doc = {
+        "_id": cluster_id,
         "project_id": req.project_id,
         "location": req.location,
         "cluster_name": req.cluster_name,
@@ -207,57 +230,49 @@ def register_cluster(req: ClusterRegister):
         "registered_at": datetime.now(timezone.utc).isoformat(),
         "status": "active",
     }
-    db.collection(FIRESTORE_COLLECTION_CLUSTERS).document(cluster_id).set(doc)
+    db.clusters.insert_one(doc)
 
     _write_audit(db, {
         "action": "cluster_registered",
         "cluster_id": cluster_id,
-        "details": doc,
+        "details": {k: v for k, v in doc.items() if k != "_id"},
     })
 
-    return {"id": cluster_id, **doc}
+    result = dict(doc)
+    result["id"] = result.pop("_id")
+    return result
 
 
 @app.get("/api/clusters/{cluster_id}")
 def get_cluster(cluster_id: str):
     db = get_db()
-    doc = db.collection(FIRESTORE_COLLECTION_CLUSTERS).document(cluster_id).get()
-    if not doc.exists:
+    doc = db.clusters.find_one({"_id": cluster_id})
+    if not doc:
         raise HTTPException(404, "Cluster not found")
-    data = doc.to_dict()
-    data["id"] = doc.id
-    return data
+    return _serialize(doc)
 
 
 @app.patch("/api/clusters/{cluster_id}")
 def update_cluster(cluster_id: str, req: ClusterUpdate):
     db = get_db()
-    ref = db.collection(FIRESTORE_COLLECTION_CLUSTERS).document(cluster_id)
-    doc = ref.get()
-    if not doc.exists:
-        raise HTTPException(404, "Cluster not found")
-
     updates = {k: v for k, v in req.model_dump().items() if v is not None}
     if not updates:
         raise HTTPException(400, "No fields to update")
 
-    ref.update(updates)
+    result = db.clusters.update_one({"_id": cluster_id}, {"$set": updates})
+    if result.matched_count == 0:
+        raise HTTPException(404, "Cluster not found")
     return {"updated": updates}
 
 
 @app.delete("/api/clusters/{cluster_id}")
 def delete_cluster(cluster_id: str):
     db = get_db()
-    ref = db.collection(FIRESTORE_COLLECTION_CLUSTERS).document(cluster_id)
-    doc = ref.get()
-    if not doc.exists:
+    result = db.clusters.delete_one({"_id": cluster_id})
+    if result.deleted_count == 0:
         raise HTTPException(404, "Cluster not found")
 
-    ref.delete()
-    _write_audit(db, {
-        "action": "cluster_deleted",
-        "cluster_id": cluster_id,
-    })
+    _write_audit(db, {"action": "cluster_deleted", "cluster_id": cluster_id})
     return {"deleted": cluster_id}
 
 
@@ -267,21 +282,16 @@ def delete_cluster(cluster_id: str):
 @app.get("/api/clusters/{cluster_id}/nodepools")
 def get_node_pools(cluster_id: str):
     db = get_db()
-    doc = db.collection(FIRESTORE_COLLECTION_CLUSTERS).document(cluster_id).get()
-    if not doc.exists:
+    cluster = db.clusters.find_one({"_id": cluster_id})
+    if not cluster:
         raise HTTPException(404, "Cluster not found")
 
-    cluster = doc.to_dict()
     gke = get_gke_client()
     pools = _fetch_node_pools(
         gke, cluster["project_id"], cluster["location"], cluster["cluster_name"]
     )
 
-    # Check if there's a saved snapshot
-    snap_doc = (
-        db.collection(FIRESTORE_COLLECTION_SNAPSHOTS).document(cluster_id).get()
-    )
-    snapshot = snap_doc.to_dict() if snap_doc.exists else None
+    snapshot = db.snapshots.find_one({"_id": cluster_id})
 
     return {
         "cluster_id": cluster_id,
@@ -289,7 +299,7 @@ def get_node_pools(cluster_id: str):
         "project_id": cluster["project_id"],
         "node_pools": pools,
         "has_snapshot": snapshot is not None,
-        "snapshot": snapshot,
+        "snapshot": _serialize(snapshot),
     }
 
 
@@ -299,29 +309,25 @@ def get_node_pools(cluster_id: str):
 @app.post("/api/clusters/{cluster_id}/scale-down")
 def scale_down(cluster_id: str, req: ScaleRequest = ScaleRequest()):
     db = get_db()
-    doc = db.collection(FIRESTORE_COLLECTION_CLUSTERS).document(cluster_id).get()
-    if not doc.exists:
+    cluster = db.clusters.find_one({"_id": cluster_id})
+    if not cluster:
         raise HTTPException(404, "Cluster not found")
 
-    cluster = doc.to_dict()
     gke = get_gke_client()
     parent = _cluster_parent(
         cluster["project_id"], cluster["location"], cluster["cluster_name"]
     )
 
-    # Fetch current state
     pools = _fetch_node_pools(
         gke, cluster["project_id"], cluster["location"], cluster["cluster_name"]
     )
 
-    # Filter pools if specific ones requested
     target_pools = pools
     if req.node_pools:
         target_pools = [p for p in pools if p["name"] in req.node_pools]
         if not target_pools:
             raise HTTPException(400, "No matching node pools found")
 
-    # Check idempotency: if all target pools already at 0
     all_zero = all(
         p["current_node_count"] == 0
         and (not p["autoscaling_enabled"] or p["max_node_count"] == 0)
@@ -336,6 +342,7 @@ def scale_down(cluster_id: str, req: ScaleRequest = ScaleRequest()):
 
     # Save snapshot BEFORE scaling down
     snapshot = {
+        "_id": cluster_id,
         "cluster_id": cluster_id,
         "node_pools": {
             p["name"]: {
@@ -344,21 +351,19 @@ def scale_down(cluster_id: str, req: ScaleRequest = ScaleRequest()):
                 "min_node_count": p["min_node_count"],
                 "max_node_count": p["max_node_count"],
             }
-            for p in pools  # save ALL pools, not just targets
+            for p in pools
         },
         "saved_at": datetime.now(timezone.utc).isoformat(),
         "saved_by": req.triggered_by,
         "status": "active",
     }
-    db.collection(FIRESTORE_COLLECTION_SNAPSHOTS).document(cluster_id).set(snapshot)
+    db.snapshots.replace_one({"_id": cluster_id}, snapshot, upsert=True)
 
-    # Scale down each target pool
     operations = []
     errors = []
     for pool in target_pools:
         pool_name = f"{parent}/nodePools/{pool['name']}"
         try:
-            # First disable autoscaling / set to 0
             if pool["autoscaling_enabled"]:
                 gke.set_node_pool_autoscaling(
                     request={
@@ -370,13 +375,8 @@ def scale_down(cluster_id: str, req: ScaleRequest = ScaleRequest()):
                         },
                     }
                 )
-
-            # Then resize to 0
             gke.set_node_pool_size(
-                request={
-                    "name": pool_name,
-                    "node_count": 0,
-                }
+                request={"name": pool_name, "node_count": 0}
             )
             operations.append({"pool": pool["name"], "status": "scaling_down"})
         except Exception as e:
@@ -407,24 +407,18 @@ def scale_down(cluster_id: str, req: ScaleRequest = ScaleRequest()):
 @app.post("/api/clusters/{cluster_id}/scale-up")
 def scale_up(cluster_id: str, req: ScaleRequest = ScaleRequest()):
     db = get_db()
-    doc = db.collection(FIRESTORE_COLLECTION_CLUSTERS).document(cluster_id).get()
-    if not doc.exists:
+    cluster = db.clusters.find_one({"_id": cluster_id})
+    if not cluster:
         raise HTTPException(404, "Cluster not found")
 
-    cluster = doc.to_dict()
-
-    # Read snapshot
-    snap_doc = (
-        db.collection(FIRESTORE_COLLECTION_SNAPSHOTS).document(cluster_id).get()
-    )
-    if not snap_doc.exists:
+    snapshot = db.snapshots.find_one({"_id": cluster_id})
+    if not snapshot:
         raise HTTPException(
             409,
             "No snapshot found. Cannot restore — original node counts unknown. "
             "Use manual scaling instead.",
         )
 
-    snapshot = snap_doc.to_dict()
     saved_pools = snapshot.get("node_pools", {})
 
     gke = get_gke_client()
@@ -432,7 +426,6 @@ def scale_up(cluster_id: str, req: ScaleRequest = ScaleRequest()):
         cluster["project_id"], cluster["location"], cluster["cluster_name"]
     )
 
-    # Filter if specific pools requested
     target_pool_names = (
         req.node_pools if req.node_pools else list(saved_pools.keys())
     )
@@ -441,17 +434,13 @@ def scale_up(cluster_id: str, req: ScaleRequest = ScaleRequest()):
     errors = []
     for pool_name in target_pool_names:
         if pool_name not in saved_pools:
-            errors.append({
-                "pool": pool_name,
-                "error": "No snapshot data for this pool",
-            })
+            errors.append({"pool": pool_name, "error": "No snapshot data for this pool"})
             continue
 
         saved = saved_pools[pool_name]
         full_pool_name = f"{parent}/nodePools/{pool_name}"
 
         try:
-            # Restore autoscaling config first
             if saved["autoscaling_enabled"]:
                 gke.set_node_pool_autoscaling(
                     request={
@@ -463,8 +452,6 @@ def scale_up(cluster_id: str, req: ScaleRequest = ScaleRequest()):
                         },
                     }
                 )
-
-            # Restore node count
             gke.set_node_pool_size(
                 request={
                     "name": full_pool_name,
@@ -480,12 +467,34 @@ def scale_up(cluster_id: str, req: ScaleRequest = ScaleRequest()):
             logger.error(f"Failed to scale up {pool_name}: {e}")
             errors.append({"pool": pool_name, "error": str(e)})
 
-    # Mark snapshot as restored
-    db.collection(FIRESTORE_COLLECTION_SNAPSHOTS).document(cluster_id).update({
-        "status": "restored",
-        "restored_at": datetime.now(timezone.utc).isoformat(),
-        "restored_by": req.triggered_by,
-    })
+    # Only mark snapshot as restored if ALL operations succeeded
+    if errors:
+        # Partial failure — keep snapshot as active for retry
+        _write_audit(db, {
+            "action": "scale_up_partial_failure",
+            "cluster_id": cluster_id,
+            "triggered_by": req.triggered_by,
+            "pools_restored": [op["pool"] for op in operations],
+            "operations": operations,
+            "errors": errors,
+        })
+        return {
+            "status": "partial_failure",
+            "cluster_id": cluster_id,
+            "message": "Some pools failed to scale up. Snapshot preserved for retry.",
+            "snapshot_used": snapshot.get("saved_at"),
+            "operations": operations,
+            "errors": errors,
+        }
+
+    db.snapshots.update_one(
+        {"_id": cluster_id},
+        {"$set": {
+            "status": "restored",
+            "restored_at": datetime.now(timezone.utc).isoformat(),
+            "restored_by": req.triggered_by,
+        }},
+    )
 
     _write_audit(db, {
         "action": "scale_up",
@@ -508,21 +517,13 @@ def scale_up(cluster_id: str, req: ScaleRequest = ScaleRequest()):
 # ─── Manual Pool Scaling ─────────────────────────────────────────────────────
 
 
-class ManualScaleRequest(BaseModel):
-    node_count: int = Field(..., ge=0)
-    update_autoscaling: bool = False
-    min_node_count: Optional[int] = None
-    max_node_count: Optional[int] = None
-
-
 @app.post("/api/clusters/{cluster_id}/nodepools/{pool_name}/scale")
 def scale_pool(cluster_id: str, pool_name: str, req: ManualScaleRequest):
     db = get_db()
-    doc = db.collection(FIRESTORE_COLLECTION_CLUSTERS).document(cluster_id).get()
-    if not doc.exists:
+    cluster = db.clusters.find_one({"_id": cluster_id})
+    if not cluster:
         raise HTTPException(404, "Cluster not found")
 
-    cluster = doc.to_dict()
     gke = get_gke_client()
     parent = _cluster_parent(
         cluster["project_id"], cluster["location"], cluster["cluster_name"]
@@ -541,7 +542,6 @@ def scale_pool(cluster_id: str, pool_name: str, req: ManualScaleRequest):
                     },
                 }
             )
-
         gke.set_node_pool_size(
             request={"name": full_name, "node_count": req.node_count}
         )
@@ -564,10 +564,10 @@ def scale_pool(cluster_id: str, pool_name: str, req: ManualScaleRequest):
 @app.get("/api/snapshots/{cluster_id}")
 def get_snapshot(cluster_id: str):
     db = get_db()
-    doc = db.collection(FIRESTORE_COLLECTION_SNAPSHOTS).document(cluster_id).get()
-    if not doc.exists:
+    doc = db.snapshots.find_one({"_id": cluster_id})
+    if not doc:
         raise HTTPException(404, "No snapshot for this cluster")
-    return doc.to_dict()
+    return _serialize(doc)
 
 
 # ─── Schedules CRUD ──────────────────────────────────────────────────────────
@@ -576,15 +576,9 @@ def get_snapshot(cluster_id: str):
 @app.get("/api/schedules")
 def list_schedules(cluster_id: Optional[str] = Query(None)):
     db = get_db()
-    query = db.collection(FIRESTORE_COLLECTION_SCHEDULES)
-    if cluster_id:
-        query = query.where("cluster_id", "==", cluster_id)
-    docs = query.stream()
-    schedules = []
-    for doc in docs:
-        data = doc.to_dict()
-        data["id"] = doc.id
-        schedules.append(data)
+    query = {"cluster_id": cluster_id} if cluster_id else {}
+    docs = db.schedules.find(query)
+    schedules = [_serialize(doc) for doc in docs]
     return {"schedules": schedules}
 
 
@@ -592,15 +586,13 @@ def list_schedules(cluster_id: Optional[str] = Query(None)):
 def create_schedule(req: ScheduleCreate):
     db = get_db()
 
-    # Verify cluster exists
-    cluster_doc = (
-        db.collection(FIRESTORE_COLLECTION_CLUSTERS).document(req.cluster_id).get()
-    )
-    if not cluster_doc.exists:
+    cluster = db.clusters.find_one({"_id": req.cluster_id})
+    if not cluster:
         raise HTTPException(404, "Cluster not found")
 
     schedule_id = str(uuid.uuid4())[:8]
     doc = {
+        "_id": schedule_id,
         "cluster_id": req.cluster_id,
         "action": req.action,
         "cron": req.cron,
@@ -611,49 +603,41 @@ def create_schedule(req: ScheduleCreate):
         "last_run": None,
         "last_status": None,
     }
-    db.collection(FIRESTORE_COLLECTION_SCHEDULES).document(schedule_id).set(doc)
+    db.schedules.insert_one(doc)
 
-    return {"id": schedule_id, **doc}
+    result = dict(doc)
+    result["id"] = result.pop("_id")
+    return result
 
 
 @app.patch("/api/schedules/{schedule_id}")
 def update_schedule(schedule_id: str, req: ScheduleUpdate):
     db = get_db()
-    ref = db.collection(FIRESTORE_COLLECTION_SCHEDULES).document(schedule_id)
-    doc = ref.get()
-    if not doc.exists:
-        raise HTTPException(404, "Schedule not found")
-
     updates = {k: v for k, v in req.model_dump().items() if v is not None}
     if not updates:
         raise HTTPException(400, "No fields to update")
 
-    ref.update(updates)
+    result = db.schedules.update_one({"_id": schedule_id}, {"$set": updates})
+    if result.matched_count == 0:
+        raise HTTPException(404, "Schedule not found")
     return {"updated": updates}
 
 
 @app.delete("/api/schedules/{schedule_id}")
 def delete_schedule(schedule_id: str):
     db = get_db()
-    ref = db.collection(FIRESTORE_COLLECTION_SCHEDULES).document(schedule_id)
-    doc = ref.get()
-    if not doc.exists:
+    result = db.schedules.delete_one({"_id": schedule_id})
+    if result.deleted_count == 0:
         raise HTTPException(404, "Schedule not found")
-
-    ref.delete()
     return {"deleted": schedule_id}
 
 
 @app.post("/api/schedules/{schedule_id}/trigger")
 def trigger_schedule(schedule_id: str):
-    """Manually trigger a schedule. Also used by Cloud Scheduler."""
     db = get_db()
-    ref = db.collection(FIRESTORE_COLLECTION_SCHEDULES).document(schedule_id)
-    doc = ref.get()
-    if not doc.exists:
+    schedule = db.schedules.find_one({"_id": schedule_id})
+    if not schedule:
         raise HTTPException(404, "Schedule not found")
-
-    schedule = doc.to_dict()
 
     try:
         if schedule["action"] == "scale_down":
@@ -669,17 +653,23 @@ def trigger_schedule(schedule_id: str):
         else:
             raise HTTPException(400, f"Unknown action: {schedule['action']}")
 
-        ref.update({
-            "last_run": datetime.now(timezone.utc).isoformat(),
-            "last_status": "success",
-        })
+        db.schedules.update_one(
+            {"_id": schedule_id},
+            {"$set": {
+                "last_run": datetime.now(timezone.utc).isoformat(),
+                "last_status": "success",
+            }},
+        )
         return result
 
     except Exception as e:
-        ref.update({
-            "last_run": datetime.now(timezone.utc).isoformat(),
-            "last_status": f"error: {str(e)[:200]}",
-        })
+        db.schedules.update_one(
+            {"_id": schedule_id},
+            {"$set": {
+                "last_run": datetime.now(timezone.utc).isoformat(),
+                "last_status": f"error: {str(e)[:200]}",
+            }},
+        )
         raise
 
 
@@ -692,19 +682,9 @@ def get_audit_log(
     limit: int = Query(50, le=200),
 ):
     db = get_db()
-    query = db.collection(FIRESTORE_COLLECTION_AUDIT).order_by(
-        "timestamp", direction=firestore.Query.DESCENDING
-    )
-    if cluster_id:
-        query = query.where("cluster_id", "==", cluster_id)
-    query = query.limit(limit)
-
-    docs = query.stream()
-    entries = []
-    for doc in docs:
-        data = doc.to_dict()
-        data["id"] = doc.id
-        entries.append(data)
+    query = {"cluster_id": cluster_id} if cluster_id else {}
+    docs = db.audit.find(query).sort("timestamp", -1).limit(limit)
+    entries = [_serialize(doc) for doc in docs]
     return {"entries": entries}
 
 
