@@ -1,0 +1,16 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '--build-arg'
+      - 'VITE_API_URL=${_VITE_API_URL}'
+      - '-t'
+      - '${_IMAGE}'
+      - '.'
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', '${_IMAGE}']
+images:
+  - '${_IMAGE}'
+substitutions:
+  _VITE_API_URL: ''
+  _IMAGE: 'gcr.io/${PROJECT_ID}/gke-scaler-frontend'
