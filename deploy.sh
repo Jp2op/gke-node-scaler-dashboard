@@ -1,29 +1,38 @@
 #!/usr/bin/env bash
 # deploy.sh - Deploy GKE Node Scaler to Cloud Run
-# Usage: ./deploy.sh <GCP_PROJECT_ID> <REGION>
-#
-# Prerequisites:
-#   - gcloud CLI authenticated
-#   - APIs enabled: run.googleapis.com, cloudbuild.googleapis.com, firestore.googleapis.com
-#   - Firestore database created in the project (Native mode)
+# Interactive - asks for project, region, and Firestore database ID
 
 set -euo pipefail
 
-PROJECT_ID="${1:?Usage: ./deploy.sh <PROJECT_ID> <REGION>}"
-REGION="${2:-asia-south1}"
+echo ""
+echo "  ╔══════════════════════════════════╗"
+echo "  ║     GKE Node Scaler Deploy      ║"
+echo "  ╚══════════════════════════════════╝"
+echo ""
+
+read -rp "  GCP Project ID: " PROJECT_ID
+if [ -z "$PROJECT_ID" ]; then echo "  ✗ Required." && exit 1; fi
+
+read -rp "  Region [asia-south1]: " REGION
+REGION="${REGION:-asia-south1}"
+
+read -rp "  Firestore Database ID [(default)]: " FIRESTORE_DATABASE
+FIRESTORE_DATABASE="${FIRESTORE_DATABASE:-(default)}"
+
+echo ""
+echo "──────────────────────────────────────────"
+echo "  Project:    ${PROJECT_ID}"
+echo "  Region:     ${REGION}"
+echo "  Firestore:  ${FIRESTORE_DATABASE}"
+echo "──────────────────────────────────────────"
+read -rp "  Proceed? (y/N): " CONFIRM
+if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then echo "  Aborted." && exit 0; fi
 
 BACKEND_IMAGE="gcr.io/${PROJECT_ID}/gke-scaler-backend"
 FRONTEND_IMAGE="gcr.io/${PROJECT_ID}/gke-scaler-frontend"
 BACKEND_SERVICE="gke-scaler-api"
 FRONTEND_SERVICE="gke-scaler-ui"
 
-echo "──────────────────────────────────────────"
-echo "  GKE Node Scaler Deployment"
-echo "  Project: ${PROJECT_ID}"
-echo "  Region:  ${REGION}"
-echo "──────────────────────────────────────────"
-
-# ─── Enable APIs ─────────────────────────────────────────────────────────────
 echo ""
 echo "→ Enabling required APIs..."
 gcloud services enable \
@@ -34,7 +43,6 @@ gcloud services enable \
   cloudscheduler.googleapis.com \
   --project="${PROJECT_ID}" --quiet
 
-# ─── Create Dedicated Service Account ────────────────────────────────────────
 BACKEND_SA_NAME="gke-scaler-sa"
 BACKEND_SA="${BACKEND_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 
@@ -53,7 +61,6 @@ for ROLE in roles/container.clusterAdmin roles/datastore.user; do
   echo "  ✓ ${ROLE}"
 done
 
-# ─── Build & Deploy Backend ──────────────────────────────────────────────────
 echo ""
 echo "→ Building backend..."
 cd backend
@@ -71,20 +78,18 @@ gcloud run deploy "${BACKEND_SERVICE}" \
   --min-instances 0 \
   --max-instances 5 \
   --allow-unauthenticated \
-  --set-env-vars="ALLOWED_ORIGINS=*" \
+  --set-env-vars="ALLOWED_ORIGINS=*,FIRESTORE_DATABASE=${FIRESTORE_DATABASE}" \
   --service-account="${BACKEND_SA}" \
   --project="${PROJECT_ID}" \
   --quiet
 cd ..
 
-# Get backend URL
 BACKEND_URL=$(gcloud run services describe "${BACKEND_SERVICE}" \
   --region="${REGION}" \
   --project="${PROJECT_ID}" \
   --format="value(status.url)")
 echo "  Backend URL: ${BACKEND_URL}"
 
-# ─── Build & Deploy Frontend ────────────────────────────────────────────────
 echo ""
 echo "→ Building frontend..."
 cd frontend
@@ -114,29 +119,25 @@ FRONTEND_URL=$(gcloud run services describe "${FRONTEND_SERVICE}" \
   --project="${PROJECT_ID}" \
   --format="value(status.url)")
 
-# ─── Update CORS ────────────────────────────────────────────────────────────
 echo ""
-echo "→ Updating backend CORS to allow frontend origin..."
+echo "→ Updating backend CORS..."
 gcloud run services update "${BACKEND_SERVICE}" \
   --region "${REGION}" \
   --project="${PROJECT_ID}" \
-  --set-env-vars="ALLOWED_ORIGINS=${FRONTEND_URL}" \
+  --set-env-vars="ALLOWED_ORIGINS=${FRONTEND_URL},FIRESTORE_DATABASE=${FIRESTORE_DATABASE}" \
   --quiet
-
-# ─── Done ────────────────────────────────────────────────────────────────────
 
 echo ""
 echo "══════════════════════════════════════════"
 echo "  DEPLOYED SUCCESSFULLY"
 echo ""
-echo "  Frontend: ${FRONTEND_URL}"
-echo "  Backend:  ${BACKEND_URL}"
-echo "  SA:       ${BACKEND_SA}"
+echo "  Frontend:   ${FRONTEND_URL}"
+echo "  Backend:    ${BACKEND_URL}"
+echo "  SA:         ${BACKEND_SA}"
+echo "  Firestore:  ${FIRESTORE_DATABASE}"
 echo ""
-echo "  NEXT STEPS:"
-echo "  1. Open ${FRONTEND_URL} and add your clusters"
-echo "  2. For cross-project clusters, grant the SA:"
-echo "     gcloud projects add-iam-policy-binding OTHER_PROJECT \\"
-echo "       --member='serviceAccount:${BACKEND_SA}' \\"
-echo "       --role='roles/container.clusterAdmin'"
+echo "  For cross-project clusters:"
+echo "  gcloud projects add-iam-policy-binding OTHER_PROJECT \\"
+echo "    --member='serviceAccount:${BACKEND_SA}' \\"
+echo "    --role='roles/container.clusterAdmin'"
 echo "══════════════════════════════════════════"

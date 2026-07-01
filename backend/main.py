@@ -38,8 +38,15 @@ FIRESTORE_COLLECTION_SCHEDULES = "gke_scaler_schedules"
 FIRESTORE_COLLECTION_AUDIT = "gke_scaler_audit"
 
 
+FIRESTORE_PROJECT = os.environ.get("FIRESTORE_PROJECT")  # None = same as Cloud Run project
+FIRESTORE_DATABASE = os.environ.get("FIRESTORE_DATABASE", "(default)")
+
+
 def get_db() -> firestore.Client:
-    return firestore.Client()
+    kwargs = {"database": FIRESTORE_DATABASE}
+    if FIRESTORE_PROJECT:
+        kwargs["project"] = FIRESTORE_PROJECT
+    return firestore.Client(**kwargs)
 
 
 def get_gke_client() -> container_v1.ClusterManagerClient:
