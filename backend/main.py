@@ -7,6 +7,7 @@ All state persisted in MongoDB. Stateless Cloud Run compatible.
 import os
 import logging
 import uuid
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -14,6 +15,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from google.cloud import container_v1
+from google.cloud import compute_v1
 from google.api_core import exceptions as gcp_exceptions
 from pymongo import MongoClient
 
@@ -85,6 +87,7 @@ class ScheduleUpdate(BaseModel):
 class ScaleRequest(BaseModel):
     node_pools: Optional[list[str]] = None
     triggered_by: str = "manual"
+    force: bool = False  # Force 0→target even on partially-running pools
 
 
 class ManualScaleRequest(BaseModel):
@@ -117,6 +120,68 @@ def _serialize(doc):
     return doc
 
 
+# GPU machine type prefixes (A100, H100, L4, etc.)
+GPU_MACHINE_PREFIXES = ("a2-", "a3-", "g2-", "a3e-", "a3u-")
+
+
+def _is_gpu_pool(np) -> bool:
+    """Detect if a node pool has GPUs via machine type or accelerator config."""
+    config = np.config
+    if not config:
+        return False
+    # Check machine type prefix
+    mt = (config.machine_type or "").lower()
+    if any(mt.startswith(p) for p in GPU_MACHINE_PREFIXES):
+        return True
+    # Check attached accelerators (e.g. n1 + nvidia-tesla-t4)
+    if config.accelerators and len(config.accelerators) > 0:
+        return True
+    return False
+
+
+def _get_mig_running_count(instance_group_urls: list[str]) -> int:
+    """Get actual running instance count from managed instance groups."""
+    if not instance_group_urls:
+        return 0
+    try:
+        client = compute_v1.InstanceGroupManagersClient()
+        total = 0
+        for url in instance_group_urls:
+            # URL: https://www.googleapis.com/compute/v1/projects/P/zones/Z/instanceGroupManagers/NAME
+            parts = url.split("/")
+            project = parts[parts.index("projects") + 1]
+            zone = parts[parts.index("zones") + 1]
+            name = parts[-1]
+
+            igm = client.get(
+                project=project, zone=zone, instance_group_manager=name
+            )
+            # current_actions.none = instances that are running and healthy
+            if igm.current_actions:
+                total += igm.current_actions.none
+            else:
+                total += igm.target_size
+        return total
+    except Exception as e:
+        logger.warning(f"Could not fetch MIG counts: {e}")
+        return -1  # -1 = unknown, caller should fall back
+
+
+def _wait_for_operation(gke, project_id, location, operation_name, timeout=120):
+    """Wait for a GKE operation to complete."""
+    op_name = f"projects/{project_id}/locations/{location}/operations/{operation_name}"
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        op = gke.get_operation(name=op_name)
+        if op.status == container_v1.Operation.Status.DONE:
+            if op.status_message:
+                logger.warning(f"Operation completed with message: {op.status_message}")
+            return op
+        time.sleep(3)
+    logger.warning(f"Operation {operation_name} timed out after {timeout}s")
+    return None
+
+
 def _fetch_node_pools(
     gke: container_v1.ClusterManagerClient,
     project_id: str,
@@ -137,26 +202,37 @@ def _fetch_node_pools(
 
     pools = []
     for np in cluster.node_pools:
-        # instance_group_urls tells us real node count:
-        # each URL is one zone's instance group, and for a resized pool
-        # the count of managed instances = total nodes.
-        # When pool is scaled to 0, instance_group_urls is empty.
-        ig_count = len(np.instance_group_urls) if np.instance_group_urls else 0
+        ig_urls = list(np.instance_group_urls) if np.instance_group_urls else []
 
-        # Best-effort live node count:
-        # - If status is RUNNING and no instance groups → 0 nodes
-        # - If status is RECONCILING → scaling in progress
-        # - initial_node_count is stale (creation-time value), don't trust it
-        # Use the node pool's status_message and instance groups to infer
-        if np.status and np.status.name in ("STOPPING", "ERROR"):
-            current_count = 0
-        elif ig_count == 0:
-            current_count = 0
-        else:
-            # For regional clusters: nodes = initial_node_count * num_zones
-            # For zonal clusters: nodes = initial_node_count
-            # But after resize, initial_node_count reflects the resize target
-            current_count = np.initial_node_count * max(ig_count, 1)
+        # Get ACTUAL running node count from Compute Engine MIGs
+        real_count = _get_mig_running_count(ig_urls)
+        if real_count < 0:
+            # Fallback: use initial_node_count * zones (target, not actual)
+            real_count = np.initial_node_count * max(len(ig_urls), 1)
+
+        # Capture full config for pool recreation if deleted
+        config = np.config
+        pool_config = {}
+        if config:
+            pool_config = {
+                "machine_type": config.machine_type or "e2-medium",
+                "disk_size_gb": config.disk_size_gb or 100,
+                "disk_type": config.disk_type or "pd-standard",
+                "image_type": config.image_type or "COS_CONTAINERD",
+                "spot": config.spot if hasattr(config, "spot") else False,
+                "oauth_scopes": list(config.oauth_scopes) if config.oauth_scopes else [
+                    "https://www.googleapis.com/auth/cloud-platform"
+                ],
+            }
+
+        # Detect GPU
+        is_gpu = _is_gpu_pool(np)
+        gpu_type = None
+        gpu_count = 0
+        if is_gpu and config and config.accelerators:
+            acc = config.accelerators[0]
+            gpu_type = acc.accelerator_type
+            gpu_count = acc.accelerator_count
 
         pool_info = {
             "name": np.name,
@@ -171,12 +247,16 @@ def _fetch_node_pools(
             "max_node_count": (
                 np.autoscaling.max_node_count if np.autoscaling else 0
             ),
-            "current_node_count": current_count,
+            "current_node_count": real_count,
             "machine_type": (
-                np.config.machine_type if np.config else "unknown"
+                config.machine_type if config else "unknown"
             ),
             "locations": list(np.locations) if np.locations else [],
-            "instance_groups": ig_count,
+            "instance_groups": len(ig_urls),
+            "pool_config": pool_config,
+            "is_gpu": is_gpu,
+            "gpu_type": gpu_type,
+            "gpu_count": gpu_count,
         }
         pools.append(pool_info)
 
@@ -272,8 +352,16 @@ def delete_cluster(cluster_id: str):
     if result.deleted_count == 0:
         raise HTTPException(404, "Cluster not found")
 
-    _write_audit(db, {"action": "cluster_deleted", "cluster_id": cluster_id})
-    return {"deleted": cluster_id}
+    # Fix #4: Cascade delete schedules and snapshot for this cluster
+    deleted_schedules = db.schedules.delete_many({"cluster_id": cluster_id})
+    db.snapshots.delete_one({"_id": cluster_id})
+
+    _write_audit(db, {
+        "action": "cluster_deleted",
+        "cluster_id": cluster_id,
+        "schedules_deleted": deleted_schedules.deleted_count,
+    })
+    return {"deleted": cluster_id, "schedules_deleted": deleted_schedules.deleted_count}
 
 
 # ─── Node Pool Info ───────────────────────────────────────────────────────────
@@ -300,7 +388,45 @@ def get_node_pools(cluster_id: str):
         "node_pools": pools,
         "has_snapshot": snapshot is not None,
         "snapshot": _serialize(snapshot),
+        "excluded_pools": cluster.get("excluded_pools", []),
     }
+
+
+# ─── Pool Exclusion Toggle ───────────────────────────────────────────────────
+
+
+class PoolExclusionUpdate(BaseModel):
+    pool_name: str
+    excluded: bool
+
+
+@app.post("/api/clusters/{cluster_id}/exclusions")
+def toggle_pool_exclusion(cluster_id: str, req: PoolExclusionUpdate):
+    db = get_db()
+    cluster = db.clusters.find_one({"_id": cluster_id})
+    if not cluster:
+        raise HTTPException(404, "Cluster not found")
+
+    excluded = cluster.get("excluded_pools", [])
+
+    if req.excluded and req.pool_name not in excluded:
+        excluded.append(req.pool_name)
+    elif not req.excluded and req.pool_name in excluded:
+        excluded.remove(req.pool_name)
+
+    db.clusters.update_one(
+        {"_id": cluster_id},
+        {"$set": {"excluded_pools": excluded}},
+    )
+
+    _write_audit(db, {
+        "action": "pool_exclusion_toggled",
+        "cluster_id": cluster_id,
+        "pool_name": req.pool_name,
+        "excluded": req.excluded,
+    })
+
+    return {"excluded_pools": excluded}
 
 
 # ─── Scale Down ───────────────────────────────────────────────────────────────
@@ -312,6 +438,8 @@ def scale_down(cluster_id: str, req: ScaleRequest = ScaleRequest()):
     cluster = db.clusters.find_one({"_id": cluster_id})
     if not cluster:
         raise HTTPException(404, "Cluster not found")
+
+    excluded_pools = cluster.get("excluded_pools", [])
 
     gke = get_gke_client()
     parent = _cluster_parent(
@@ -328,10 +456,23 @@ def scale_down(cluster_id: str, req: ScaleRequest = ScaleRequest()):
         if not target_pools:
             raise HTTPException(400, "No matching node pools found")
 
+    # Separate excluded pools
+    pools_to_scale = [p for p in target_pools if p["name"] not in excluded_pools]
+    pools_excluded = [p for p in target_pools if p["name"] in excluded_pools]
+
+    # Fix #5: Early return if all pools are excluded
+    if not pools_to_scale:
+        return {
+            "status": "all_excluded",
+            "message": "All pools are excluded from scale-down. Nothing to do.",
+            "cluster_id": cluster_id,
+            "skipped": [{"pool": p["name"], "status": "excluded"} for p in pools_excluded],
+        }
+
     all_zero = all(
         p["current_node_count"] == 0
         and (not p["autoscaling_enabled"] or p["max_node_count"] == 0)
-        for p in target_pools
+        for p in pools_to_scale
     )
     if all_zero:
         return {
@@ -340,16 +481,22 @@ def scale_down(cluster_id: str, req: ScaleRequest = ScaleRequest()):
             "cluster_id": cluster_id,
         }
 
-    # Save snapshot BEFORE scaling down
+    # Save snapshot BEFORE scaling — mark all as was_scaled_down initially
+    # IMPORTANT: Save initial_node_count (per-zone target from GKE API)
+    # NOT current_node_count (total across all MIGs).
+    # set_node_pool_size expects per-zone count.
     snapshot = {
         "_id": cluster_id,
         "cluster_id": cluster_id,
         "node_pools": {
             p["name"]: {
-                "initial_node_count": p["current_node_count"],
+                "initial_node_count": p["initial_node_count"],  # per-zone, for restore
+                "total_node_count": p["current_node_count"],    # total, for reference
                 "autoscaling_enabled": p["autoscaling_enabled"],
                 "min_node_count": p["min_node_count"],
                 "max_node_count": p["max_node_count"],
+                "pool_config": p.get("pool_config", {}),
+                "was_scaled_down": p["name"] not in excluded_pools,
             }
             for p in pools
         },
@@ -361,11 +508,19 @@ def scale_down(cluster_id: str, req: ScaleRequest = ScaleRequest()):
 
     operations = []
     errors = []
-    for pool in target_pools:
+    skipped = []
+
+    for pool in pools_excluded:
+        skipped.append({"pool": pool["name"], "status": "excluded"})
+        logger.info(f"Pool {pool['name']}: excluded from scale-down")
+
+    for pool in pools_to_scale:
         pool_name = f"{parent}/nodePools/{pool['name']}"
         try:
+            # Save original autoscaling before modifying
+            autoscaling_changed = False
             if pool["autoscaling_enabled"]:
-                gke.set_node_pool_autoscaling(
+                as_op = gke.set_node_pool_autoscaling(
                     request={
                         "name": pool_name,
                         "autoscaling": {
@@ -375,19 +530,59 @@ def scale_down(cluster_id: str, req: ScaleRequest = ScaleRequest()):
                         },
                     }
                 )
-            gke.set_node_pool_size(
-                request={"name": pool_name, "node_count": 0}
-            )
-            operations.append({"pool": pool["name"], "status": "scaling_down"})
+                # Wait for autoscaling change before resize to avoid
+                # "operation in progress" error
+                _wait_for_operation(
+                    gke, cluster["project_id"], cluster["location"], as_op.name,
+                    timeout=60,
+                )
+                autoscaling_changed = True
+
+            try:
+                gke.set_node_pool_size(
+                    request={"name": pool_name, "node_count": 0}
+                )
+                operations.append({"pool": pool["name"], "status": "scaling_down"})
+            except Exception as resize_err:
+                # Resize failed — rollback autoscaling if we changed it
+                if autoscaling_changed:
+                    try:
+                        gke.set_node_pool_autoscaling(
+                            request={
+                                "name": pool_name,
+                                "autoscaling": {
+                                    "enabled": True,
+                                    "min_node_count": pool["min_node_count"],
+                                    "max_node_count": pool["max_node_count"],
+                                },
+                            }
+                        )
+                        logger.info(f"Rolled back autoscaling for {pool['name']}")
+                    except Exception as rollback_err:
+                        logger.error(f"Failed to rollback autoscaling for {pool['name']}: {rollback_err}")
+                raise resize_err
+
         except Exception as e:
             logger.error(f"Failed to scale down {pool['name']}: {e}")
             errors.append({"pool": pool["name"], "error": str(e)})
+
+    # Fix #1: Update snapshot — mark failed pools as was_scaled_down=false
+    # so restore doesn't try to restore a pool that was never actually scaled down
+    if errors:
+        failed_pool_names = [e["pool"] for e in errors]
+        for pool_name in failed_pool_names:
+            db.snapshots.update_one(
+                {"_id": cluster_id},
+                {"$set": {f"node_pools.{pool_name}.was_scaled_down": False}},
+            )
+        logger.info(f"Updated snapshot: marked {failed_pool_names} as was_scaled_down=false")
 
     _write_audit(db, {
         "action": "scale_down",
         "cluster_id": cluster_id,
         "triggered_by": req.triggered_by,
-        "pools_targeted": [p["name"] for p in target_pools],
+        "pools_targeted": [p["name"] for p in pools_to_scale],
+        "pools_excluded": [p["name"] for p in pools_excluded],
         "operations": operations,
         "errors": errors,
     })
@@ -397,6 +592,7 @@ def scale_down(cluster_id: str, req: ScaleRequest = ScaleRequest()):
         "cluster_id": cluster_id,
         "snapshot_saved": True,
         "operations": operations,
+        "skipped": skipped,
         "errors": errors,
     }
 
@@ -426,23 +622,93 @@ def scale_up(cluster_id: str, req: ScaleRequest = ScaleRequest()):
         cluster["project_id"], cluster["location"], cluster["cluster_name"]
     )
 
+    # Fetch LIVE pool state to decide what actually needs restoring
+    live_pools = _fetch_node_pools(
+        gke, cluster["project_id"], cluster["location"], cluster["cluster_name"]
+    )
+    live_pool_map = {p["name"]: p for p in live_pools}
+
     target_pool_names = (
         req.node_pools if req.node_pools else list(saved_pools.keys())
     )
 
     operations = []
     errors = []
+    skipped = []
+
     for pool_name in target_pool_names:
         if pool_name not in saved_pools:
             errors.append({"pool": pool_name, "error": "No snapshot data for this pool"})
             continue
 
         saved = saved_pools[pool_name]
+        target_count = saved["initial_node_count"]
+        live = live_pool_map.get(pool_name)
+
+        # Skip pools that weren't scaled down (e.g. excluded GPU pools)
+        if not saved.get("was_scaled_down", True):
+            skipped.append({
+                "pool": pool_name,
+                "status": "was_excluded",
+                "current_count": live["current_node_count"] if live else 0,
+                "target_count": target_count,
+                "message": "Was not scaled down — no action needed",
+            })
+            logger.info(f"Pool {pool_name}: was not scaled down — skipping restore")
+            continue
+
+        # Fix #2: Skip pools with target_count=0 (were at 0 before scale-down)
+        if target_count == 0:
+            skipped.append({
+                "pool": pool_name,
+                "status": "target_zero",
+                "current_count": live["current_node_count"] if live else 0,
+                "target_count": 0,
+                "message": "Was at 0 nodes before scale-down — nothing to restore",
+            })
+            logger.info(f"Pool {pool_name}: target is 0 — skipping restore")
+            continue
+
+        # Skip pools that no longer exist in the cluster.
+        # If someone deleted a pool intentionally, we don't recreate it.
+        if not live:
+            skipped.append({
+                "pool": pool_name,
+                "status": "pool_deleted",
+                "current_count": 0,
+                "target_count": target_count,
+                "message": f"Pool no longer exists in cluster — skipped. Scale down again to update the snapshot.",
+            })
+            logger.info(f"Pool {pool_name}: not found in live cluster — skipping")
+            continue
+
+        # Skip pools that already have running nodes.
+        # - Pool at target (4/4): fully healthy, skip.
+        # - Pool partially up (3/4): GKE is already retrying the missing
+        #   node. Cycling 0→4 would kill the 3 healthy ones. Skip.
+        # - Pool at 0 (0/4): completely down, needs restore. Proceed.
+        # UNLESS force=True, then cycle 0→target regardless (user accepts disruption).
+        if live and live["current_node_count"] > 0 and not req.force:
+            skipped.append({
+                "pool": pool_name,
+                "status": "already_running",
+                "current_count": live["current_node_count"],
+                "target_count": target_count,
+                "message": (
+                    "fully restored" if live["current_node_count"] >= target_count
+                    else f"{live['current_node_count']}/{target_count} nodes up — GKE is provisioning the rest. Use Force Restore to cycle this pool."
+                ),
+            })
+            logger.info(
+                f"Pool {pool_name}: {live['current_node_count']}/{target_count} nodes running — skipping (force={req.force})"
+            )
+            continue
+
         full_pool_name = f"{parent}/nodePools/{pool_name}"
 
         try:
             if saved["autoscaling_enabled"]:
-                gke.set_node_pool_autoscaling(
+                as_op = gke.set_node_pool_autoscaling(
                     request={
                         "name": full_pool_name,
                         "autoscaling": {
@@ -452,56 +718,77 @@ def scale_up(cluster_id: str, req: ScaleRequest = ScaleRequest()):
                         },
                     }
                 )
+                _wait_for_operation(
+                    gke, cluster["project_id"], cluster["location"], as_op.name,
+                    timeout=60,
+                )
+
+            # Force re-provision: reset to 0 first, wait, then set target.
+            # Without this, if a previous restore set target=N but VMs
+            # couldn't provision, calling set(N) again is a no-op.
+            # We wait for set(0) to complete, but fire set(N) without waiting
+            # to avoid Cloud Run timeout with many pools.
+            op = gke.set_node_pool_size(
+                request={"name": full_pool_name, "node_count": 0}
+            )
+            _wait_for_operation(
+                gke, cluster["project_id"], cluster["location"], op.name,
+                timeout=60,  # 60s per pool, not 120
+            )
             gke.set_node_pool_size(
                 request={
                     "name": full_pool_name,
-                    "node_count": saved["initial_node_count"],
+                    "node_count": target_count,
                 }
             )
+            # Don't wait for set(N) — GKE will provision nodes asynchronously
             operations.append({
                 "pool": pool_name,
                 "status": "scaling_up",
-                "target_count": saved["initial_node_count"],
+                "target_count": target_count,
             })
         except Exception as e:
             logger.error(f"Failed to scale up {pool_name}: {e}")
             errors.append({"pool": pool_name, "error": str(e)})
 
-    # Only mark snapshot as restored if ALL operations succeeded
+    # Only mark snapshot as restored if ALL pools are healthy (none failed)
+    all_done = len(errors) == 0 and len(operations) + len(skipped) == len(target_pool_names)
+
     if errors:
-        # Partial failure — keep snapshot as active for retry
         _write_audit(db, {
             "action": "scale_up_partial_failure",
             "cluster_id": cluster_id,
             "triggered_by": req.triggered_by,
-            "pools_restored": [op["pool"] for op in operations],
             "operations": operations,
+            "skipped": skipped,
             "errors": errors,
         })
         return {
             "status": "partial_failure",
             "cluster_id": cluster_id,
-            "message": "Some pools failed to scale up. Snapshot preserved for retry.",
+            "message": "Some pools failed to scale up. Snapshot preserved — click Restore to retry only the failed pools.",
             "snapshot_used": snapshot.get("saved_at"),
             "operations": operations,
+            "skipped": skipped,
             "errors": errors,
         }
 
-    db.snapshots.update_one(
-        {"_id": cluster_id},
-        {"$set": {
-            "status": "restored",
-            "restored_at": datetime.now(timezone.utc).isoformat(),
-            "restored_by": req.triggered_by,
-        }},
-    )
+    if all_done:
+        db.snapshots.update_one(
+            {"_id": cluster_id},
+            {"$set": {
+                "status": "restored",
+                "restored_at": datetime.now(timezone.utc).isoformat(),
+                "restored_by": req.triggered_by,
+            }},
+        )
 
     _write_audit(db, {
         "action": "scale_up",
         "cluster_id": cluster_id,
         "triggered_by": req.triggered_by,
-        "pools_restored": [op["pool"] for op in operations],
         "operations": operations,
+        "skipped": skipped,
         "errors": errors,
     })
 
@@ -510,6 +797,7 @@ def scale_up(cluster_id: str, req: ScaleRequest = ScaleRequest()):
         "cluster_id": cluster_id,
         "snapshot_used": snapshot.get("saved_at"),
         "operations": operations,
+        "skipped": skipped,
         "errors": errors,
     }
 

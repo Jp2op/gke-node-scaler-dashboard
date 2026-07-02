@@ -27,6 +27,7 @@ export const api = {
   scaleDown: (clusterId, body = {}) => request(`/api/clusters/${clusterId}/scale-down`, { method: 'POST', body: JSON.stringify(body) }),
   scaleUp: (clusterId, body = {}) => request(`/api/clusters/${clusterId}/scale-up`, { method: 'POST', body: JSON.stringify(body) }),
   scalePool: (clusterId, poolName, body) => request(`/api/clusters/${clusterId}/nodepools/${poolName}/scale`, { method: 'POST', body: JSON.stringify(body) }),
+  togglePoolExclusion: (clusterId, poolName, excluded) => request(`/api/clusters/${clusterId}/exclusions`, { method: 'POST', body: JSON.stringify({ pool_name: poolName, excluded }) }),
 
   // Snapshots
   getSnapshot: (clusterId) => request(`/api/snapshots/${clusterId}`),

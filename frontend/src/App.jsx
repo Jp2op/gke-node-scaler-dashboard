@@ -310,12 +310,14 @@ function ClusterCard({ cluster, onRefresh, toast }) {
   const [showSchedule, setShowSchedule] = useState(false)
   const [schedules, setSchedules] = useState([])
   const [confirmDelete, setConfirmDelete] = useState(false)
+  const [excludedPools, setExcludedPools] = useState([])
 
   const fetchPools = async () => {
     setLoadingPools(true)
     try {
       const data = await api.getNodePools(cluster.id)
       setPoolData(data)
+      setExcludedPools(data.excluded_pools || [])
     } catch (e) {
       toast.show(e.message, 'error')
     } finally {
@@ -342,12 +344,17 @@ function ClusterCard({ cluster, onRefresh, toast }) {
     setScaling('down')
     try {
       const result = await api.scaleDown(cluster.id)
-      toast.show(
-        result.status === 'already_scaled_down'
-          ? 'Already at 0, no action needed.'
-          : `Scaling down. Snapshot saved.`,
-        result.status === 'already_scaled_down' ? 'info' : 'success'
-      )
+      const excluded = result.skipped?.filter(s => s.status === 'excluded').map(s => s.pool) || []
+      if (result.status === 'already_scaled_down') {
+        toast.show('Already at 0, no action needed.', 'info')
+      } else if (result.status === 'all_excluded') {
+        toast.show('All pools are excluded — nothing to scale down.', 'info')
+      } else {
+        let msg = 'Scaling down. Snapshot saved.'
+        if (excluded.length) msg += ` Excluded: ${excluded.join(', ')}`
+        if (result.errors?.length) msg += ` Failed: ${result.errors.map(e => e.pool).join(', ')}`
+        toast.show(msg, result.errors?.length ? 'error' : 'success')
+      }
       await fetchPools()
     } catch (e) {
       toast.show(e.message, 'error')
@@ -364,10 +371,21 @@ function ClusterCard({ cluster, onRefresh, toast }) {
       const result = await api.scaleUp(cluster.id)
       if (result.status === 'partial_failure') {
         const failed = result.errors?.map(e => e.pool).join(', ')
-        toast.show(`Scale-up failed for: ${failed}. Snapshot preserved — retry when capacity is available.`, 'error')
+        toast.show(`Failed: ${failed}. Snapshot preserved — click Restore to retry only failed pools.`, 'error')
       } else {
         const restored = result.operations?.map(o => `${o.pool}→${o.target_count}`).join(', ')
-        toast.show(`Restoring: ${restored}`, 'success')
+        const skippedFull = result.skipped?.filter(s => s.status === 'already_running' && s.current_count >= s.target_count).map(s => s.pool) || []
+        const skippedPartial = result.skipped?.filter(s => s.status === 'already_running' && s.current_count < s.target_count).map(s => `${s.pool} (${s.current_count}/${s.target_count})`) || []
+        const skippedDeleted = result.skipped?.filter(s => s.status === 'pool_deleted').map(s => s.pool) || []
+        const skippedExcluded = result.skipped?.filter(s => s.status === 'was_excluded').map(s => s.pool) || []
+        const skippedZero = result.skipped?.filter(s => s.status === 'target_zero').map(s => s.pool) || []
+        let msg = restored ? `Restoring: ${restored}` : 'All pools already running'
+        if (skippedFull.length) msg += ` | OK: ${skippedFull.join(', ')}`
+        if (skippedPartial.length) msg += ` | Provisioning: ${skippedPartial.join(', ')}`
+        if (skippedDeleted.length) msg += ` | Deleted: ${skippedDeleted.join(', ')}`
+        if (skippedExcluded.length) msg += ` | Excluded: ${skippedExcluded.join(', ')}`
+        if (skippedZero.length) msg += ` | Was empty: ${skippedZero.join(', ')}`
+        toast.show(msg, 'success')
       }
       await fetchPools()
     } catch (e) {
@@ -408,8 +426,28 @@ function ClusterCard({ cluster, onRefresh, toast }) {
     }
   }
 
+  const handleToggleExclusion = async (poolName, currentlyExcluded) => {
+    try {
+      const result = await api.togglePoolExclusion(cluster.id, poolName, !currentlyExcluded)
+      setExcludedPools(result.excluded_pools || [])
+      toast.show(
+        !currentlyExcluded
+          ? `${poolName} excluded from scale-down`
+          : `${poolName} included in scale-down`,
+        'info'
+      )
+    } catch (e) {
+      toast.show(e.message, 'error')
+    }
+  }
+
   const allPoolsZero = poolData?.node_pools?.every(p => p.current_node_count === 0) ?? false
   const totalNodes = poolData?.node_pools?.reduce((s, p) => s + (p.current_node_count || 0), 0) ?? null
+  const hasPartialPools = poolData?.node_pools?.some(p => {
+    const sp = poolData?.snapshot?.node_pools?.[p.name]
+    const target = sp?.total_node_count ?? sp?.initial_node_count
+    return target && p.current_node_count > 0 && p.current_node_count < target
+  }) ?? false
 
   return (
     <>
@@ -421,7 +459,7 @@ function ClusterCard({ cluster, onRefresh, toast }) {
         >
           <div className="flex items-center gap-3.5">
             <div className={`w-2.5 h-2.5 rounded-full ${
-              poolData ? (allPoolsZero ? 'bg-red-500' : 'bg-emerald-500') : 'bg-zinc-600'
+              poolData ? (allPoolsZero ? 'bg-red-500' : hasPartialPools ? 'bg-amber-500' : 'bg-emerald-500') : 'bg-zinc-600'
             }`} />
             <div>
               <div className="flex items-center gap-2.5">
@@ -435,8 +473,8 @@ function ClusterCard({ cluster, onRefresh, toast }) {
                 {totalNodes !== null && (
                   <>
                     <span className="text-xs text-zinc-600">·</span>
-                    <span className={`text-xs font-medium ${allPoolsZero ? 'text-red-400' : 'text-emerald-400'}`}>
-                      {totalNodes} node{totalNodes !== 1 ? 's' : ''}
+                    <span className={`text-xs font-medium ${allPoolsZero ? 'text-red-400' : hasPartialPools ? 'text-amber-400' : 'text-emerald-400'}`}>
+                      {totalNodes} node{totalNodes !== 1 ? 's' : ''}{hasPartialPools ? ' (partial)' : ''}
                     </span>
                   </>
                 )}
@@ -516,32 +554,94 @@ function ClusterCard({ cluster, onRefresh, toast }) {
                       <th className="text-center pb-2 font-medium">Nodes</th>
                       <th className="text-center pb-2 font-medium">Autoscale</th>
                       <th className="text-center pb-2 font-medium">Status</th>
+                      <th className="text-center pb-2 font-medium">Scale</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-zinc-800/50">
-                    {poolData.node_pools.map(pool => (
-                      <tr key={pool.name} className="text-zinc-300">
-                        <td className="py-2.5 font-mono text-sm">{pool.name}</td>
-                        <td className="py-2.5 text-zinc-500 font-mono text-xs">{pool.machine_type}</td>
+                    {poolData.node_pools.map(pool => {
+                      const isExcluded = excludedPools.includes(pool.name)
+                      return (
+                      <tr key={pool.name} className={`text-zinc-300 ${isExcluded ? 'opacity-60' : ''}`}>
+                        <td className="py-2.5">
+                          <div className="flex items-center gap-2">
+                            <span className="font-mono text-sm">{pool.name}</span>
+                            {pool.is_gpu && (
+                              <span className="px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider rounded bg-violet-500/20 text-violet-400 border border-violet-500/30">
+                                GPU
+                              </span>
+                            )}
+                          </div>
+                        </td>
+                        <td className="py-2.5 text-zinc-500 font-mono text-xs">
+                          {pool.machine_type}
+                          {pool.gpu_type && <span className="ml-1 text-violet-400/60">({pool.gpu_type}×{pool.gpu_count})</span>}
+                        </td>
                         <td className="py-2.5 text-center">
-                          <span className={`font-semibold ${pool.current_node_count === 0 ? 'text-red-400' : 'text-emerald-400'}`}>
-                            {pool.current_node_count}
-                          </span>
+                          {(() => {
+                            const actual = pool.current_node_count
+                            const snapshotPool = poolData?.snapshot?.node_pools?.[pool.name]
+                            const displayTarget = snapshotPool?.total_node_count ?? snapshotPool?.initial_node_count
+                            const isPartial = displayTarget && actual > 0 && actual < displayTarget
+
+                            if (isPartial) {
+                              return (
+                                <span className="font-semibold text-amber-400" title={`${actual} of ${displayTarget} nodes provisioned`}>
+                                  {actual}/{displayTarget}
+                                </span>
+                              )
+                            }
+                            return (
+                              <span className={`font-semibold ${actual === 0 ? 'text-red-400' : 'text-emerald-400'}`}>
+                                {actual}
+                              </span>
+                            )
+                          })()}
                         </td>
                         <td className="py-2.5 text-center text-xs text-zinc-500">
                           {pool.autoscaling_enabled ? `${pool.min_node_count}–${pool.max_node_count}` : 'off'}
                         </td>
                         <td className="py-2.5 text-center">
-                          <span className={`text-xs px-2 py-0.5 rounded ${
-                            pool.status === 'RUNNING' ? 'bg-emerald-500/15 text-emerald-400' :
-                            pool.status === 'RECONCILING' ? 'bg-yellow-500/15 text-yellow-400' :
-                            'bg-zinc-700 text-zinc-400'
-                          }`}>
-                            {pool.status}
-                          </span>
+                          {(() => {
+                            const actual = pool.current_node_count
+                            const snapshotPool = poolData?.snapshot?.node_pools?.[pool.name]
+                            const snapshotTarget = snapshotPool?.total_node_count ?? snapshotPool?.initial_node_count
+                            const wasScaledDown = snapshotPool?.was_scaled_down
+
+                            if (pool.status === 'ERROR' || pool.status === 'RUNNING_WITH_ERROR') {
+                              return <span className="text-xs px-2 py-0.5 rounded bg-red-500/15 text-red-400">ERROR</span>
+                            }
+                            if (pool.status === 'RECONCILING') {
+                              return <span className="text-xs px-2 py-0.5 rounded bg-yellow-500/15 text-yellow-400">RECONCILING</span>
+                            }
+                            if (actual === 0 && wasScaledDown) {
+                              return <span className="text-xs px-2 py-0.5 rounded bg-red-500/15 text-red-400">SCALED DOWN</span>
+                            }
+                            if (snapshotTarget && actual > 0 && actual < snapshotTarget) {
+                              return <span className="text-xs px-2 py-0.5 rounded bg-amber-500/15 text-amber-400">PARTIAL</span>
+                            }
+                            if (snapshotTarget && actual >= snapshotTarget && wasScaledDown) {
+                              return <span className="text-xs px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-400">SCALED UP</span>
+                            }
+                            return <span className={`text-xs px-2 py-0.5 rounded ${
+                              pool.status === 'RUNNING' ? 'bg-emerald-500/15 text-emerald-400' : 'bg-zinc-700 text-zinc-400'
+                            }`}>{pool.status}</span>
+                          })()}
+                        </td>
+                        <td className="py-2.5 text-center">
+                          {pool.is_gpu ? (
+                            <button
+                              onClick={() => handleToggleExclusion(pool.name, isExcluded)}
+                              className={`relative w-9 h-5 rounded-full transition-colors ${isExcluded ? 'bg-zinc-700' : 'bg-emerald-600'}`}
+                              title={isExcluded ? 'Excluded from scale-down' : 'Included in scale-down'}
+                            >
+                              <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${isExcluded ? 'left-0.5' : 'left-[18px]'}`} />
+                            </button>
+                          ) : (
+                            <span className="text-xs text-zinc-600">—</span>
+                          )}
                         </td>
                       </tr>
-                    ))}
+                    )})}
                   </tbody>
                 </table>
               </div>

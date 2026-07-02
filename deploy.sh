@@ -66,7 +66,7 @@ else
 fi
 
 echo "  Granting roles..."
-for ROLE in roles/container.clusterAdmin roles/datastore.user; do
+for ROLE in roles/container.clusterAdmin roles/datastore.user roles/compute.viewer; do
   gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
     --member="serviceAccount:${BACKEND_SA}" \
     --role="${ROLE}" \
