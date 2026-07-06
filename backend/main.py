@@ -482,16 +482,33 @@ def scale_down(cluster_id: str, req: ScaleRequest = ScaleRequest()):
         }
 
     # Save snapshot BEFORE scaling — mark all as was_scaled_down initially
-    # IMPORTANT: Save initial_node_count (per-zone target from GKE API)
-    # NOT current_node_count (total across all MIGs).
-    # set_node_pool_size expects per-zone count.
+    # For restore count (per-zone):
+    # - Non-autoscaling pools: use GKE API's initial_node_count (per-zone target)
+    # - Autoscaling pools: initial_node_count can be 0 from a previous scale-down
+    #   even if nodes are running (autoscaler manages MIGs directly).
+    #   Use max(initial_node_count, ceil(actual_running / num_zones)) instead.
+    import math
+
+    def _compute_restore_count(p):
+        num_zones = max(p.get("instance_groups", 1), 1)
+        per_zone_from_mig = (
+            math.ceil(p["current_node_count"] / num_zones)
+            if p["current_node_count"] > 0 else 0
+        )
+        if p["autoscaling_enabled"]:
+            # For autoscaling: prefer actual running count over stale initial_node_count
+            return max(p["initial_node_count"], per_zone_from_mig, p.get("min_node_count", 0))
+        else:
+            # For non-autoscaling: initial_node_count is the user-set target
+            return p["initial_node_count"]
+
     snapshot = {
         "_id": cluster_id,
         "cluster_id": cluster_id,
         "node_pools": {
             p["name"]: {
-                "initial_node_count": p["initial_node_count"],  # per-zone, for restore
-                "total_node_count": p["current_node_count"],    # total, for reference
+                "initial_node_count": _compute_restore_count(p),  # per-zone, for restore
+                "total_node_count": p["current_node_count"],       # total, for reference
                 "autoscaling_enabled": p["autoscaling_enabled"],
                 "min_node_count": p["min_node_count"],
                 "max_node_count": p["max_node_count"],
@@ -524,9 +541,7 @@ def scale_down(cluster_id: str, req: ScaleRequest = ScaleRequest()):
                     request={
                         "name": pool_name,
                         "autoscaling": {
-                            "enabled": True,
-                            "min_node_count": 0,
-                            "max_node_count": 1,
+                            "enabled": False,
                         },
                     }
                 )
@@ -557,7 +572,7 @@ def scale_down(cluster_id: str, req: ScaleRequest = ScaleRequest()):
                                 },
                             }
                         )
-                        logger.info(f"Rolled back autoscaling for {pool['name']}")
+                        logger.info(f"Rolled back autoscaling for {pool['name']} to enabled min={pool['min_node_count']} max={pool['max_node_count']}")
                     except Exception as rollback_err:
                         logger.error(f"Failed to rollback autoscaling for {pool['name']}: {rollback_err}")
                 raise resize_err
@@ -644,6 +659,7 @@ def scale_up(cluster_id: str, req: ScaleRequest = ScaleRequest()):
         saved = saved_pools[pool_name]
         target_count = saved["initial_node_count"]
         live = live_pool_map.get(pool_name)
+        full_pool_name = f"{parent}/nodePools/{pool_name}"
 
         # Skip pools that weren't scaled down (e.g. excluded GPU pools)
         if not saved.get("was_scaled_down", True):
@@ -689,6 +705,28 @@ def scale_up(cluster_id: str, req: ScaleRequest = ScaleRequest()):
         # - Pool at 0 (0/4): completely down, needs restore. Proceed.
         # UNLESS force=True, then cycle 0→target regardless (user accepts disruption).
         if live and live["current_node_count"] > 0 and not req.force:
+            # Still restore autoscaling config even if we skip the node cycle.
+            # Without this, autoscaling stays at min=0/max=1 from scale-down.
+            if saved.get("autoscaling_enabled"):
+                try:
+                    as_op = gke.set_node_pool_autoscaling(
+                        request={
+                            "name": full_pool_name,
+                            "autoscaling": {
+                                "enabled": True,
+                                "min_node_count": saved["min_node_count"],
+                                "max_node_count": saved["max_node_count"],
+                            },
+                        }
+                    )
+                    _wait_for_operation(
+                        gke, cluster["project_id"], cluster["location"], as_op.name,
+                        timeout=60,
+                    )
+                    logger.info(f"Pool {pool_name}: restored autoscaling to min={saved['min_node_count']}, max={saved['max_node_count']}")
+                except Exception as e:
+                    logger.error(f"Failed to restore autoscaling for {pool_name}: {e}")
+
             skipped.append({
                 "pool": pool_name,
                 "status": "already_running",
@@ -703,8 +741,6 @@ def scale_up(cluster_id: str, req: ScaleRequest = ScaleRequest()):
                 f"Pool {pool_name}: {live['current_node_count']}/{target_count} nodes running — skipping (force={req.force})"
             )
             continue
-
-        full_pool_name = f"{parent}/nodePools/{pool_name}"
 
         try:
             if saved["autoscaling_enabled"]:
@@ -979,6 +1015,6 @@ def get_audit_log(
 # ─── Health ───────────────────────────────────────────────────────────────────
 
 
-@app.get("/healthz")
+@app.get("/api/healthz")
 def health():
     return {"status": "ok", "service": "gke-node-scaler"}

@@ -508,9 +508,6 @@ function ClusterCard({ cluster, onRefresh, toast }) {
               <button onClick={fetchPools} disabled={loadingPools} className="flex items-center gap-2 px-3 py-2 text-sm rounded-lg bg-zinc-800 border border-zinc-700 text-zinc-400 hover:bg-zinc-700 transition-colors disabled:opacity-40">
                 <RefreshCw size={14} className={loadingPools ? 'animate-spin' : ''} />
               </button>
-              <button onClick={() => setShowSchedule(true)} className="flex items-center gap-2 px-3 py-2 text-sm rounded-lg bg-zinc-800 border border-zinc-700 text-zinc-400 hover:bg-zinc-700 transition-colors">
-                <Calendar size={14} /> Schedule
-              </button>
               <div className="flex-1" />
               <button onClick={() => setConfirmDelete(true)} className="flex items-center gap-2 px-3 py-2 text-sm rounded-lg text-zinc-600 hover:text-red-400 hover:bg-red-500/10 transition-colors">
                 <Trash2 size={14} />
